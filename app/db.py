@@ -17,24 +17,27 @@ from typing import Iterator
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
-    job_id          TEXT PRIMARY KEY,
-    status          TEXT NOT NULL,
-    feature_dim     INTEGER NOT NULL,
-    epochs          INTEGER NOT NULL,
-    batch_size      INTEGER NOT NULL,
-    record_count    INTEGER NOT NULL,
-    total_batches   INTEGER NOT NULL,
-    learning_rate   REAL NOT NULL,
-    momentum        REAL NOT NULL,
-    features_json   TEXT NOT NULL,
-    labels_json     TEXT NOT NULL,
-    weights_json    TEXT NOT NULL,
-    velocity_json   TEXT NOT NULL,
-    loss            REAL NOT NULL,
-    completed_steps INTEGER NOT NULL DEFAULT 0,
-    created_at      REAL NOT NULL,
-    updated_at      REAL NOT NULL,
-    finished_at     REAL
+    job_id            TEXT PRIMARY KEY,
+    status            TEXT NOT NULL,
+    feature_dim       INTEGER NOT NULL,
+    epochs            INTEGER NOT NULL,
+    batch_size        INTEGER NOT NULL,
+    record_count      INTEGER NOT NULL,
+    total_batches     INTEGER NOT NULL,
+    learning_rate     REAL NOT NULL,
+    momentum          REAL NOT NULL,
+    features_json     TEXT NOT NULL,
+    labels_json       TEXT NOT NULL,
+    weights_json      TEXT NOT NULL,
+    velocity_json     TEXT NOT NULL,
+    loss              REAL NOT NULL,
+    completed_steps   INTEGER NOT NULL DEFAULT 0,
+    quarantined       INTEGER NOT NULL DEFAULT 0,
+    quarantine_reason TEXT,
+    quarantined_at    REAL,
+    created_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL,
+    finished_at       REAL
 );
 
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -84,6 +87,14 @@ CREATE TABLE IF NOT EXISTS lease_epochs (
 CREATE INDEX IF NOT EXISTS idx_events_job ON job_events(job_id, id);
 """
 
+# Columns added after the first release.  A training database restored from an
+# older archive may not have them, so ``init_db`` applies these idempotently.
+_JOB_COLUMN_MIGRATIONS = {
+    "quarantined": "ALTER TABLE jobs ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
+    "quarantine_reason": "ALTER TABLE jobs ADD COLUMN quarantine_reason TEXT",
+    "quarantined_at": "ALTER TABLE jobs ADD COLUMN quarantined_at REAL",
+}
+
 
 def connect(path: Path | str) -> sqlite3.Connection:
     path = Path(path)
@@ -132,14 +143,26 @@ def reader(path: Path | str) -> Iterator[sqlite3.Connection]:
 
 
 def init_db(path: Path | str) -> None:
-    """Create the schema if missing.
+    """Create the schema if missing, then migrate older restored databases.
 
     ``executescript`` commits implicitly, so it must not run inside our
     hand-managed transaction; concurrent starts serialise on SQLite's schema
-    lock and every statement is idempotent.
+    lock and every statement is idempotent.  The column migrations bring a
+    pre-verification database (restored from an archive) up to date; a
+    concurrent starter may apply the same ALTER first, so a duplicate-column
+    error is tolerated.
     """
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+        for column, statement in _JOB_COLUMN_MIGRATIONS.items():
+            if column in existing:
+                continue
+            try:
+                conn.execute(statement)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
     finally:
         conn.close()

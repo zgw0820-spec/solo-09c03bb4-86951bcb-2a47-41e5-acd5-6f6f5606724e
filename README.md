@@ -41,14 +41,47 @@ docker compose up -d --build
 | --- | --- | --- |
 | `POST` | `/jobs` | 提交 `{"features": [[...]], "labels": [...], "epochs": 3}`，返回 201 与任务 |
 | `GET` | `/jobs` | 最近任务列表 |
-| `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights` |
+| `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights`；含隔离状态 |
 | `GET` | `/jobs/{job_id}/checkpoints` | 全部批次断点（可按 `after_step` 增量拉取） |
-| `GET` | `/jobs/{job_id}/events` | 审计事件：创建、开始/从第几步续训、完成、丢失租约 |
+| `GET` | `/jobs/{job_id}/events` | 审计事件：创建、开始/从第几步续训、完成、丢失租约、核验通过、被隔离 |
+| `POST` | `/jobs/{job_id}/verify` | 逐批重算核验全部断点；异常时隔离该任务（见下文） |
 | `GET` | `/workers` | 工作器心跳与租约持有者 |
 | `GET` | `/health` | 健康检查 |
 
 `Swagger`（`/docs`）里直接 `POST /jobs` 提交即可看到训练开始；`GET /jobs/{id}` 与
-`GET /jobs/{id}/checkpoints` 查看进度与每个断点的权重/动量/损失。
+`GET /jobs/{id}/checkpoints` 查看进度与每个断点的权重/动量/损失；`POST /jobs/{id}/verify`
+只需任务 ID 即可在 Swagger 里直接执行核验。
+
+## 断点核验与隔离
+
+恢复历史训练库后，对任意任务执行 `POST /jobs/{job_id}/verify`：
+
+1. **一致快照**：在一个读事务里取出任务行与全部断点（WAL 快照，不阻塞工作器写入）。
+2. **逐批重放**：用任务里保存的样本与训练参数（学习率、动量、批大小），从零权重
+   开始逐批重算权重、动量与损失，与每个断点逐一比对——即使最新断点与任务进度
+   完全相符，中间批次的失真也会在它自己的步数上被发现。同时校验任务行当前状态
+   与重放结果是否一致（含初始零状态、完成状态与步数的一致性）。
+3. **原子结论**：在同一个 `BEGIN IMMEDIATE` 事务里复核进度并落地结论：
+   - `ok`：确认进度在核验期间没有变化，断点可信、可用于续训，记录
+     `checkpoint_verified` 事件；
+   - `failed`：返回**首个**缺失或不一致的步数与原因（缺失、权重/动量/损失不符、
+     出现进度之外的断点、任务行撕裂等），并在同一事务里**隔离**该任务
+     （`quarantined=1`、删除租约、记录 `job_quarantined` 事件）。断点是只追加的，
+     已被判定异常的历史不会因后续提交而"自愈"；
+   - `stale`：核验期间任务进度发生了变化，本次不下结论（核验绝不把已过期的
+     快照误报为通过），重试即可。
+
+隔离后的行为：
+
+- 工作器不再提交该任务的批次（提交路径在事务内检查隔离标志，迟到唤醒的旧工作器
+  同样被 `JobQuarantined` 围栏挡下），也不会接管该任务（`claimable_jobs` 已过滤）；
+- 任务状态、原有断点、事件仍可正常查询（`GET /jobs/{id}` 对隔离任务放宽了
+  "最新断点必须等于进度"的硬校验，否则会查询不到被判定撕裂的任务）；
+- 其他任务照常训练；已完成但被判异常的任务保留 `completed` 状态，但不再提供
+  `final_weights`（结果不可信）。
+
+从旧归档恢复的训练库缺少隔离相关列，所有进程启动时的 `init_db` 会幂等地
+`ALTER TABLE` 补齐，无需手工迁移。
 
 ## 续跑与防回退机制
 
@@ -72,10 +105,11 @@ python3 scripts/demo.py
 # 没有 Docker 时用本机进程演示同样流程
 python3 scripts/demo.py --local
 
-# 不依赖 Docker 的三项自检
+# 不依赖 Docker 的四项自检（含断点核验与隔离）
 python3 scripts/selftest.py
 
-# 单元/集成测试（含真实 uvicorn + 两个工作器进程、SIGKILL 接管、迟到工作器围栏）
+# 单元/集成测试（含真实 uvicorn + 两个工作器进程、SIGKILL 接管、迟到工作器围栏、
+# 断点核验/隔离/交错提交）
 python3 -m pytest -q
 ```
 
@@ -98,14 +132,14 @@ python3 -m pytest -q
 ## 目录
 
 ```
-app/main.py       API 与 Swagger
-app/worker.py     工作器主循环、租约续训
-app/store.py      任务状态机、批次提交、断点查询
+app/main.py       API 与 Swagger（含 POST /jobs/{id}/verify）
+app/worker.py     工作器主循环、租约续训（隔离任务按丢失租约处理）
+app/store.py      任务状态机、批次提交、断点查询、断点核验与隔离
 app/lease.py      租约获取/续约/围栏校验
 app/model.py      逻辑回归、交叉熵、SGD + 动量
 app/features.py   输入校验与标准化
-app/db.py         SQLite 连接与表结构
-tests/            单元、API、进程级集成测试
+app/db.py         SQLite 连接、表结构与旧库迁移
+tests/            单元、API、核验、进程级集成测试
 scripts/demo.py   Swagger 同款接口的端到端演示
 scripts/selftest.py  无 Docker 自检
 ```

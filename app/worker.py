@@ -133,13 +133,17 @@ class Worker:
                     self.lease,
                     self.settings.batch_delay_seconds,
                 )
-            except LeaseLost:
-                print(f"[{self.worker_id}] lost lease on {job_id}; stopping", flush=True)
+            except LeaseLost as exc:
+                print(f"[{self.worker_id}] cannot continue {job_id}: {exc}", flush=True)
                 store.record_event(
                     self.settings.db_path,
                     job_id,
                     "lease_lost",
-                    {"worker_id": self.worker_id, "lease_epoch": self.lease.epoch},
+                    {
+                        "worker_id": self.worker_id,
+                        "lease_epoch": self.lease.epoch,
+                        "reason": str(exc),
+                    },
                 )
                 self.lease = None
                 return

@@ -6,6 +6,9 @@
 2. ``equivalence``: with real worker processes, kill one mid-training and prove
    the finished weights are bit-identical to an uninterrupted run.
 3. ``late``: a frozen (still-running) old worker cannot write after takeover.
+4. ``verify``: a distorted checkpoint is found by the verification API while
+   the worker is still committing; the job is quarantined (its worker stops,
+   nobody takes over, state stays queryable) and a second job trains on.
 
 Each check prints PASS/FAIL and exits non-zero if anything fails.
 """
@@ -271,6 +274,83 @@ def check_late_worker(tmp: Path) -> bool:
     return True
 
 
+def check_verification(tmp: Path) -> bool:
+    """Distort a checkpoint mid-training, then prove the verify API finds the
+    exact step, quarantines the job (its worker stops, nobody takes over, the
+    state stays queryable) and leaves a second job to finish normally."""
+    import sqlite3
+
+    db = tmp / "verify.db"
+    api, port = start_api(db)
+    worker = start_worker(db, "worker-a")
+    try:
+        job = post(port, "/jobs", dataset(seed=11, records=40))
+        job_id = job["job_id"]
+        wait_for(
+            lambda: get(port, f"/jobs/{job_id}")["completed_steps"] >= 3,
+            60,
+            "training progress",
+        )
+
+        # Distort the weights of an early checkpoint directly in the shared
+        # database, as a damaged restore would.
+        conn = sqlite3.connect(str(db), timeout=30)
+        try:
+            raw = conn.execute(
+                "SELECT weights_json FROM checkpoints WHERE job_id=? AND step=2",
+                (job_id,),
+            ).fetchone()[0]
+            tampered = json.loads(raw)
+            tampered[0] += 0.5
+            conn.execute(
+                "UPDATE checkpoints SET weights_json=? WHERE job_id=? AND step=2",
+                (json.dumps(tampered), job_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        verdict = post(port, f"/jobs/{job_id}/verify", {})
+        assert verdict["status"] == "failed", verdict
+        assert verdict["first_bad_step"] == 2, verdict
+        assert "weights mismatch" in verdict["reason"], verdict
+        assert verdict["quarantined"] is True, verdict
+
+        # The running worker must stop submitting: progress freezes here even
+        # though the job is unfinished.  (The verdict landed while the worker
+        # was actively committing - the interleaving did not wash it out.)
+        frozen = get(port, f"/jobs/{job_id}")["completed_steps"]
+        time.sleep(DELAY * 5)
+        state = get(port, f"/jobs/{job_id}")
+        assert state["completed_steps"] == frozen, state
+        assert state["quarantined"] is True, state
+        assert state["status"] != "completed" or frozen == state["total_steps"]
+
+        # Status, checkpoints and the quarantine event stay queryable.
+        checkpoints = get(port, f"/jobs/{job_id}/checkpoints")
+        assert [c["step"] for c in checkpoints] == list(range(1, frozen + 1))
+        events = get(port, f"/jobs/{job_id}/events")
+        quarantined = [e for e in events if e["event"] == "job_quarantined"]
+        assert quarantined, events
+        assert quarantined[0]["detail"]["first_bad_step"] == 2
+
+        # A second job is unaffected and verifies clean once finished.
+        other = post(port, "/jobs", dataset(seed=12, records=24))
+        done = completed_state(port, other["job_id"])
+        assert done["quarantined"] is False
+        ok = post(port, f"/jobs/{other['job_id']}/verify", {})
+        assert ok["status"] == "ok", ok
+        assert ok["verified_steps"] == ok["total_steps"], ok
+    finally:
+        stop(worker)
+        stop(api)
+    print(
+        f"  PASS: distorted checkpoint 2 found, job quarantined at step {frozen},"
+        f" worker stopped, second job completed and verified ok"
+    )
+    return True
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as raw:
@@ -279,6 +359,7 @@ def main() -> int:
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
+            ("checkpoint verification", lambda: check_verification(tmp)),
         ):
             print(f"[{name}]")
             try:

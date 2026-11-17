@@ -47,6 +47,15 @@ class StateConflict(RuntimeError):
     """The database changed in a way that should be impossible."""
 
 
+class JobQuarantined(LeaseLost):
+    """The job was quarantined by checkpoint verification.
+
+    Raised instead of committing a batch, so a worker holding the lease stops
+    training the job exactly as if it had lost ownership.  Subclassing
+    ``LeaseLost`` keeps the worker loop unchanged.
+    """
+
+
 def _dumps(values: np.ndarray) -> str:
     return json.dumps([float(v) for v in values], allow_nan=False)
 
@@ -132,18 +141,21 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
     """Read a consistent snapshot of the latest confirmed state.
 
     The job row and its newest checkpoint are read in one transaction.  Their
-    step and weights must agree; a mismatch would mean a torn commit.
+    step and weights must agree; a mismatch would mean a torn commit.  A
+    quarantined job is exempt from that hard failure: verification may have
+    condemned exactly this inconsistency, and its state must stay queryable.
     """
     with reader(db_path) as conn:
         row = _job_row(conn, job_id)
         if row is None:
             return None
+        quarantined = bool(row["quarantined"])
         checkpoint = conn.execute(
             "SELECT step, weights_json, velocity_json, loss FROM checkpoints "
             "WHERE job_id=? ORDER BY step DESC LIMIT 1",
             (job_id,),
         ).fetchone()
-        if int(row["completed_steps"]) != 0:
+        if int(row["completed_steps"]) != 0 and not quarantined:
             if checkpoint is None or int(checkpoint["step"]) != int(row["completed_steps"]):
                 raise StateConflict("latest checkpoint does not match confirmed progress")
             if checkpoint["weights_json"] != row["weights_json"]:
@@ -160,6 +172,9 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
     return {
         "job_id": row["job_id"],
         "status": row["status"],
+        "quarantined": quarantined,
+        "quarantine_reason": row["quarantine_reason"],
+        "quarantined_at": row["quarantined_at"],
         "feature_dim": int(row["feature_dim"]),
         "record_count": int(row["record_count"]),
         "epochs": int(row["epochs"]),
@@ -176,7 +191,9 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
         "weights": _loads(row["weights_json"]).tolist(),
         "momentum_velocity": _loads(row["velocity_json"]).tolist(),
         "final_weights": (
-            _loads(row["weights_json"]).tolist() if row["status"] == "completed" else None
+            _loads(row["weights_json"]).tolist()
+            if row["status"] == "completed" and not quarantined
+            else None
         ),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -256,6 +273,7 @@ def claimable_jobs(db_path, limit: int = 20) -> list[str]:
             """
             SELECT job_id FROM jobs
              WHERE status IN ('queued','running')
+               AND quarantined = 0
                AND completed_steps < total_batches * epochs
              ORDER BY created_at LIMIT ?
             """,
@@ -275,14 +293,18 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
     if batch_delay > 0:
         time.sleep(batch_delay)
     with transaction(db_path) as conn:
+        row = _job_row(conn, lease.job_id)
+        if row is None:
+            raise JobNotFound(lease.job_id)
+        if row["quarantined"] and row["status"] != "completed":
+            raise JobQuarantined(
+                f"job {lease.job_id} is quarantined: {row['quarantine_reason']}"
+            )
         if not owner_ok(conn, lease):
             raise LeaseLost(
                 f"job {lease.job_id} is no longer owned by {lease.worker_id}@{lease.epoch}"
             )
 
-        row = _job_row(conn, lease.job_id)
-        if row is None:
-            raise JobNotFound(lease.job_id)
         if row["status"] == "completed":
             return {
                 "status": "completed",
@@ -326,6 +348,7 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
                SET weights_json=?, velocity_json=?, loss=?, completed_steps=?,
                    status=?, updated_at=?, finished_at=?
              WHERE job_id=? AND completed_steps=? AND status IN ('queued','running')
+               AND quarantined=0
             """,
             (
                 _dumps(new_weights),
@@ -385,3 +408,358 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
 def record_event(db_path, job_id: str, event: str, detail: dict[str, Any] | None = None) -> None:
     with transaction(db_path) as conn:
         _event(conn, job_id, event, detail)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint verification
+#
+# Verification answers: "can these checkpoints be trusted to resume from?"
+# It runs in three phases so its conclusion always refers to one consistent
+# progress snapshot even while workers keep committing batches:
+#
+# 1. ``_verification_snapshot`` reads the job row and every checkpoint in one
+#    WAL read transaction - a single consistent view of the database.
+# 2. ``_replay_verdict`` recomputes weights, momentum and loss batch by batch
+#    from the saved samples and training parameters, outside any transaction,
+#    and compares them against the stored checkpoints and the job row.
+# 3. ``_commit_verdict`` re-reads the job inside one ``BEGIN IMMEDIATE``
+#    transaction.  A pass is only returned if the confirmed progress is
+#    exactly what the snapshot saw; otherwise the verdict is ``stale`` and
+#    nothing is concluded.  A failure quarantines the job in the same
+#    transaction, so a worker that commits afterwards cannot rewrite the
+#    outcome: checkpoints are append-only, a condemned history cannot heal.
+# ---------------------------------------------------------------------------
+
+
+def _verification_snapshot(db_path, job_id: str) -> dict[str, Any]:
+    """One consistent read of everything verification needs.
+
+    Vector payloads stay as raw JSON text here; parsing happens in
+    ``_replay_verdict`` so that a damaged restore is reported as a failed
+    verification (and quarantined) instead of crashing the check.
+    """
+    with reader(db_path) as conn:
+        row = _job_row(conn, job_id)
+        if row is None:
+            raise JobNotFound(job_id)
+        checkpoints = conn.execute(
+            "SELECT step, weights_json, velocity_json, loss, batch_loss "
+            "FROM checkpoints WHERE job_id=? ORDER BY step",
+            (job_id,),
+        ).fetchall()
+    return {
+        "job_id": job_id,
+        "status": row["status"],
+        "quarantined": bool(row["quarantined"]),
+        "completed_steps": int(row["completed_steps"]),
+        "total_steps": int(row["total_batches"]) * int(row["epochs"]),
+        "per_epoch": int(row["total_batches"]),
+        "record_count": int(row["record_count"]),
+        "learning_rate": float(row["learning_rate"]),
+        "momentum": float(row["momentum"]),
+        "features_json": row["features_json"],
+        "labels_json": row["labels_json"],
+        "job_weights_json": row["weights_json"],
+        "job_velocity_json": row["velocity_json"],
+        "job_loss": float(row["loss"]),
+        "checkpoints": [
+            {
+                "step": int(c["step"]),
+                "weights_json": c["weights_json"],
+                "velocity_json": c["velocity_json"],
+                "loss": float(c["loss"]),
+                "batch_loss": float(c["batch_loss"]),
+            }
+            for c in checkpoints
+        ],
+    }
+
+
+def _vector_diff(expected: np.ndarray, actual: np.ndarray) -> float:
+    """Largest absolute deviation; ``inf`` when shapes disagree."""
+    if expected.shape != actual.shape:
+        return math.inf
+    if expected.size == 0:
+        return 0.0
+    return float(np.max(np.abs(expected - actual)))
+
+
+def _failed(step: int, reason: str, verified_steps: int) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "first_bad_step": step,
+        "reason": reason,
+        "verified_steps": verified_steps,
+    }
+
+
+def _replay_verdict(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Replay training from zero and compare every stored checkpoint.
+
+    The replay starts from the all-zero initial state and applies the exact
+    SGD + momentum updates a worker would, so a distorted batch is caught at
+    its own step even when every later checkpoint - and the job row - is
+    perfectly consistent with the confirmed progress.  Stored payloads that
+    cannot even be parsed are reported as corruption, not raised.
+    """
+    completed = snapshot["completed_steps"]
+    total = snapshot["total_steps"]
+    per_epoch = snapshot["per_epoch"]
+    lr = snapshot["learning_rate"]
+    momentum = snapshot["momentum"]
+    by_step = {c["step"]: c for c in snapshot["checkpoints"]}
+
+    if per_epoch < 1 or total <= 0:
+        return _failed(
+            0,
+            f"job metadata is inconsistent (batches_per_epoch={per_epoch}, "
+            f"total_steps={total})",
+            verified_steps=0,
+        )
+    if completed < 0 or completed > total:
+        return _failed(
+            completed,
+            f"confirmed progress {completed} is outside 0..{total} steps",
+            verified_steps=0,
+        )
+    try:
+        design = np.asarray(json.loads(snapshot["features_json"]), dtype=np.float64)
+        targets = np.asarray(json.loads(snapshot["labels_json"]), dtype=np.float64)
+        job_weights = _loads(snapshot["job_weights_json"])
+        job_velocity = _loads(snapshot["job_velocity_json"])
+    except (json.JSONDecodeError, ValueError) as exc:
+        return _failed(0, f"stored training data is not parseable: {exc}", 0)
+    if design.ndim != 2 or targets.ndim != 1 or design.shape[0] != targets.shape[0]:
+        return _failed(0, "stored design matrix and labels are malformed", 0)
+    if design.shape[0] != snapshot["record_count"]:
+        return _failed(
+            0,
+            f"stored design matrix has {design.shape[0]} rows but the job "
+            f"claims {snapshot['record_count']} records",
+            0,
+        )
+
+    weights = np.zeros(design.shape[1], dtype=np.float64)
+    velocity = np.zeros(design.shape[1], dtype=np.float64)
+    expected_loss = dataset_loss(weights, design, targets)
+    for step in range(1, completed + 1):
+        start = ((step - 1) % per_epoch) * BATCH_SIZE
+        end = min(start + BATCH_SIZE, snapshot["record_count"])
+        weights, velocity, batch_loss = sgd_step(
+            weights, velocity, design[start:end], targets[start:end], lr, momentum
+        )
+        expected_loss = dataset_loss(weights, design, targets)
+        checkpoint = by_step.pop(step, None)
+        if checkpoint is None:
+            return _failed(
+                step, f"checkpoint missing at step {step}", verified_steps=step - 1
+            )
+        try:
+            checkpoint_weights = _loads(checkpoint["weights_json"])
+            checkpoint_velocity = _loads(checkpoint["velocity_json"])
+        except (json.JSONDecodeError, ValueError) as exc:
+            return _failed(
+                step, f"checkpoint at step {step} is not parseable: {exc}", step - 1
+            )
+        diff = _vector_diff(weights, checkpoint_weights)
+        if diff != 0.0:
+            return _failed(
+                step,
+                f"checkpoint weights mismatch at step {step} (max abs diff {diff:.3e})",
+                verified_steps=step - 1,
+            )
+        diff = _vector_diff(velocity, checkpoint_velocity)
+        if diff != 0.0:
+            return _failed(
+                step,
+                f"checkpoint momentum mismatch at step {step} (max abs diff {diff:.3e})",
+                verified_steps=step - 1,
+            )
+        if checkpoint["batch_loss"] != batch_loss:
+            return _failed(
+                step,
+                f"checkpoint batch_loss mismatch at step {step} "
+                f"(expected {batch_loss!r}, stored {checkpoint['batch_loss']!r})",
+                verified_steps=step - 1,
+            )
+        if checkpoint["loss"] != expected_loss:
+            return _failed(
+                step,
+                f"checkpoint loss mismatch at step {step} "
+                f"(expected {expected_loss!r}, stored {checkpoint['loss']!r})",
+                verified_steps=step - 1,
+            )
+
+    # The checkpoint chain is intact through the confirmed progress; now the
+    # job row itself must equal the replayed state at that step.
+    diff = _vector_diff(weights, job_weights)
+    if diff != 0.0:
+        return _failed(
+            completed,
+            f"job weights do not match the replayed state at confirmed step "
+            f"{completed} (max abs diff {diff:.3e})",
+            verified_steps=completed,
+        )
+    diff = _vector_diff(velocity, job_velocity)
+    if diff != 0.0:
+        return _failed(
+            completed,
+            f"job momentum does not match the replayed state at confirmed step "
+            f"{completed} (max abs diff {diff:.3e})",
+            verified_steps=completed,
+        )
+    if snapshot["job_loss"] != expected_loss:
+        return _failed(
+            completed,
+            f"job loss {snapshot['job_loss']!r} does not match the replayed "
+            f"loss {expected_loss!r} at confirmed step {completed}",
+            verified_steps=completed,
+        )
+    if snapshot["status"] == "completed" and completed < total:
+        return _failed(
+            completed,
+            f"job is marked completed after {completed} of {total} steps",
+            verified_steps=completed,
+        )
+    if snapshot["status"] != "completed" and completed == total:
+        return _failed(
+            completed,
+            f"all {total} steps committed but job status is "
+            f"'{snapshot['status']}' instead of 'completed'",
+            verified_steps=completed,
+        )
+    if by_step:
+        extra = min(by_step)
+        return _failed(
+            extra,
+            f"unexpected checkpoint at step {extra} "
+            f"(outside confirmed progress 1..{completed})",
+            verified_steps=completed,
+        )
+    return {
+        "status": "ok",
+        "first_bad_step": None,
+        "reason": None,
+        "verified_steps": completed,
+    }
+
+
+def _commit_verdict(
+    db_path, snapshot: dict[str, Any], verdict: dict[str, Any]
+) -> dict[str, Any]:
+    """Persist the verdict and build the response, atomically.
+
+    ``ok`` is only concluded when the job's confirmed progress and quarantine
+    state are unchanged since the snapshot - anything else is ``stale`` and
+    proves nothing.  ``failed`` quarantines the job (first writer wins) and
+    drops its lease so the current holder stops at its next renewal.
+    """
+    job_id = snapshot["job_id"]
+    now = time.time()
+    with transaction(db_path) as conn:
+        row = _job_row(conn, job_id)
+        if row is None:
+            raise JobNotFound(job_id)
+        current_steps = int(row["completed_steps"])
+        quarantined = bool(row["quarantined"])
+        quarantine_reason = row["quarantine_reason"]
+
+        if verdict["status"] == "ok":
+            if current_steps != snapshot["completed_steps"] or quarantined != snapshot["quarantined"]:
+                return {
+                    "job_id": job_id,
+                    "status": "stale",
+                    "resumable": False,
+                    "verified_steps": None,
+                    "first_bad_step": None,
+                    "reason": (
+                        "job moved during verification "
+                        f"(snapshot step {snapshot['completed_steps']}, now "
+                        f"{current_steps}, quarantined={quarantined}); "
+                        "re-run for a current verdict"
+                    ),
+                    "snapshot_completed_steps": snapshot["completed_steps"],
+                    "current_completed_steps": current_steps,
+                    "total_steps": snapshot["total_steps"],
+                    "checkpoints_checked": len(snapshot["checkpoints"]),
+                    "quarantined": quarantined,
+                    "quarantine_reason": quarantine_reason,
+                    "verified_at": now,
+                }
+            _event(
+                conn,
+                job_id,
+                "checkpoint_verified",
+                {
+                    "verified_steps": verdict["verified_steps"],
+                    "total_steps": snapshot["total_steps"],
+                    "checkpoints_checked": len(snapshot["checkpoints"]),
+                },
+            )
+            return {
+                "job_id": job_id,
+                "status": "ok",
+                "resumable": not quarantined,
+                "verified_steps": verdict["verified_steps"],
+                "first_bad_step": None,
+                "reason": None,
+                "snapshot_completed_steps": snapshot["completed_steps"],
+                "current_completed_steps": current_steps,
+                "total_steps": snapshot["total_steps"],
+                "checkpoints_checked": len(snapshot["checkpoints"]),
+                "quarantined": quarantined,
+                "quarantine_reason": quarantine_reason,
+                "verified_at": now,
+            }
+
+        if not quarantined:
+            conn.execute(
+                "UPDATE jobs SET quarantined=1, quarantine_reason=?, "
+                "quarantined_at=?, updated_at=? WHERE job_id=?",
+                (verdict["reason"], now, now, job_id),
+            )
+            # Force the current holder's next renewal to fail so it stops
+            # before even attempting another commit.
+            conn.execute("DELETE FROM leases WHERE job_id=?", (job_id,))
+            _event(
+                conn,
+                job_id,
+                "job_quarantined",
+                {
+                    "first_bad_step": verdict["first_bad_step"],
+                    "reason": verdict["reason"],
+                    "snapshot_completed_steps": snapshot["completed_steps"],
+                    "verified_steps": verdict["verified_steps"],
+                },
+            )
+            quarantined = True
+            quarantine_reason = verdict["reason"]
+    return {
+        "job_id": job_id,
+        "status": "failed",
+        "resumable": False,
+        "verified_steps": verdict["verified_steps"],
+        "first_bad_step": verdict["first_bad_step"],
+        "reason": verdict["reason"],
+        "snapshot_completed_steps": snapshot["completed_steps"],
+        "current_completed_steps": current_steps,
+        "total_steps": snapshot["total_steps"],
+        "checkpoints_checked": len(snapshot["checkpoints"]),
+        "quarantined": quarantined,
+        "quarantine_reason": quarantine_reason,
+        "verified_at": now,
+    }
+
+
+def verify_job(db_path, job_id: str) -> dict[str, Any]:
+    """Verify every stored checkpoint of ``job_id`` by exact replay.
+
+    Returns ``ok`` when each batch's weights, momentum and loss recompute to
+    the stored values through the confirmed progress; ``failed`` with the
+    first missing or inconsistent step (the job is quarantined atomically);
+    or ``stale`` when the job moved while verification ran, in which case
+    nothing is concluded.
+    """
+    snapshot = _verification_snapshot(db_path, job_id)
+    verdict = _replay_verdict(snapshot)
+    return _commit_verdict(db_path, snapshot, verdict)

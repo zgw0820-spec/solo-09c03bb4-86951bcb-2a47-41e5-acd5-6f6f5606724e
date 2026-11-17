@@ -30,9 +30,13 @@ app = FastAPI(
         "regression with batch size 8, learning rate 0.1 and momentum 0.9.\n\n"
         "All training is executed by workers. Every batch commits weights, "
         "momentum, loss and progress in one atomic checkpoint; after a failure "
-        "the next worker resumes from the newest committed checkpoint."
+        "the next worker resumes from the newest committed checkpoint.\n\n"
+        "POST /jobs/{job_id}/verify replays every batch from the saved samples "
+        "and confirms each stored checkpoint is reproducible; a job whose "
+        "checkpoints are missing or distorted is quarantined so workers stop "
+        "training it while its state stays queryable."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -107,6 +111,31 @@ def get_events(job_id: str) -> list[dict[str, Any]]:
     """Audit trail: creation, takeover/resume points and completion."""
     try:
         return store.list_events(settings.db_path, job_id)
+    except store.JobNotFound as exc:
+        raise HTTPException(status_code=404, detail="job not found") from exc
+
+
+@app.post("/jobs/{job_id}/verify", tags=["verification"])
+def verify_checkpoints(job_id: str) -> dict[str, Any]:
+    """Replay every batch from the saved samples and training parameters and
+    compare recomputed weights, momentum and loss against each stored
+    checkpoint - including batches in the middle of the stream, not just the
+    latest one.
+
+    The verdict always refers to one consistent progress snapshot:
+
+    * ``ok`` - every checkpoint through the confirmed progress matches the
+      replay; the checkpoints can be trusted for resuming training.
+    * ``failed`` - the first missing or inconsistent step and the reason.
+      The job is quarantined atomically: workers stop submitting batches for
+      it and will not take it over, while its status, checkpoints and events
+      remain queryable.  Other jobs are unaffected.
+    * ``stale`` - the job's progress moved while verification ran, so no
+      conclusion was reached (a verification never reports a pass for a
+      snapshot that is no longer current).  Re-run for a current verdict.
+    """
+    try:
+        return store.verify_job(settings.db_path, job_id)
     except store.JobNotFound as exc:
         raise HTTPException(status_code=404, detail="job not found") from exc
 
